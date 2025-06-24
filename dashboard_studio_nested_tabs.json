@@ -1,0 +1,115 @@
+{
+  "visualizations": {
+    "error_chart": {
+      "type": "splunk.line",
+      "dataSources": {
+        "primary": "search_error_chart"
+      },
+      "title": "$env$ - $app$ Error Trend"
+    },
+    "error_table": {
+      "type": "splunk.table",
+      "dataSources": {
+        "primary": "search_live_tail"
+      },
+      "title": "$env$ - $app$ Live Errors"
+    }
+  },
+  "dataSources": {
+    "search_error_chart": {
+      "type": "ds.search",
+      "options": {
+        "query": "index=your_index environment=$env$ sourcetype=$sourcetype$ log_level=ERROR | timechart span=1h count as error_count",
+        "queryParameters": {
+          "earliest": "$time_range.earliest$",
+          "latest": "$time_range.latest$"
+        }
+      }
+    },
+    "search_live_tail": {
+      "type": "ds.search",
+      "options": {
+        "query": "index=your_index environment=$env$ sourcetype=$sourcetype$ log_level=ERROR | table _time host message | sort -_time | head 20",
+        "queryParameters": {
+          "earliest": "rt-2m",
+          "latest": "rt"
+        }
+      }
+    }
+  },
+  "inputs": {
+    "env": {
+      "type": "input.radio",
+      "title": "Environment",
+      "defaultValue": "UNIT",
+      "options": [
+        {
+          "label": "UNIT",
+          "value": "UNIT"
+        },
+        {
+          "label": "INTG",
+          "value": "INTG"
+        },
+        {
+          "label": "PROD",
+          "value": "PROD"
+        }
+      ]
+    },
+    "app": {
+      "type": "input.radio",
+      "title": "Application",
+      "defaultValue": "IHS",
+      "options": [
+        {
+          "label": "IHS",
+          "value": "IHS"
+        },
+        {
+          "label": "WebSphere",
+          "value": "WAS"
+        },
+        {
+          "label": "MQ",
+          "value": "MQ"
+        },
+        {
+          "label": "DataPower",
+          "value": "DP"
+        }
+      ]
+    },
+    "time_range": {
+      "type": "input.timerange",
+      "title": "Time Range",
+      "defaultValue": "-24h@h,now"
+    }
+  },
+  "layout": {
+    "type": "grid",
+    "options": {},
+    "structure": [
+      {
+        "item": "error_chart",
+        "type": "block",
+        "position": {
+          "x": 0,
+          "y": 0,
+          "w": 12,
+          "h": 6
+        }
+      },
+      {
+        "item": "error_table",
+        "type": "block",
+        "position": {
+          "x": 0,
+          "y": 6,
+          "w": 12,
+          "h": 6
+        }
+      }
+    ]
+  }
+}
