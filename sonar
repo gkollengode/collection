@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SONAR_URL="https://sonarqube.example.com"
+ADMIN_TOKEN="sqadm_xxx"   # user token with System Admin perms
+
+auth() { curl -sS -H "Authorization: Bearer ${ADMIN_TOKEN}" "$@"; }
+
+echo "user,token_name,token_type,project_key,created_at,expires_at,last_used_at"
+
+page=1
+while :; do
+  resp="$(auth "${SONAR_URL}/api/users/search?p=${page}&ps=500")"
+  users=$(jq -r '.users[].login' <<<"$resp")
+  [[ -z "$users" ]] && break
+
+  for u in $users; do
+    auth "${SONAR_URL}/api/user_tokens/search?login=${u}" \
+    | jq -r --arg u "$u" '
+        .userTokens[]
+        | [
+            $u,
+            .name,
+            .type,                      # USER_TOKEN | PROJECT_ANALYSIS_TOKEN | GLOBAL_ANALYSIS_TOKEN
+            (.project?.key // ""),
+            .createdAt,
+            (.expirationDate // ""),
+            (.lastConnectionDate // "")
+          ]
+        | @csv'
+  done
+
+  # next page?
+  (( $(jq -r '.paging.pageIndex' <<<"$resp") * $(jq -r '.paging.pageSize' <<<"$resp") < $(jq -r '.paging.total' <<<"$resp") )) || break
+  page=$((page+1))
+done
