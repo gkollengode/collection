@@ -1,67 +1,46 @@
 sonarqube_tokens_report:
   image: alpine:3.20
   variables:
-    SONAR_URL: "https://sonarqube.example.com"   # set your URL
-    # Add this in GitLab → CI/CD → Variables (masked, protected)
+    SONAR_URL: "https://sonarqube.example.com"
     SONAR_ADMIN_TOKEN: "$SONAR_ADMIN_TOKEN"
   before_script:
-    - apk add --no-cache bash curl jq coreutils
+    - apk add --no-cache curl jq coreutils
   script:
+    # init CSVs without shell redirection edge cases
+    - printf "user,token_name,token_type,project_key,created_at,expires_at,last_used_at\n" | tee user_tokens.csv >/dev/null
+    - printf "project_key,token_name,owner_login,created_at,expires_at,last_used_at\n"      | tee project_tokens.csv >/dev/null
+
+    # loop with plain /bin/sh
     - |
-      bash <<'BASH'
-      set -euo pipefail
-
-      auth() {
-        # Bearer auth (SQ 9+). If your SQ expects Basic, swap to:
-        # curl -sS -u "${SONAR_ADMIN_TOKEN}:" "$@"
-        curl -sS -H "Authorization: Bearer ${SONAR_ADMIN_TOKEN}" "$@"
-      }
-
-      # ---------- user_tokens.csv ----------
-      echo "user,token_name,token_type,project_key,created_at,expires_at,last_used_at" > user_tokens.csv
       page=1
       while :; do
-        resp="$(auth "${SONAR_URL}/api/users/search?p=${page}&ps=500")"
-        users=$(jq -r '.users[].login' <<<"$resp")
-        [ -z "${users}" ] && break
+        resp="$(curl -sS -H "Authorization: Bearer ${SONAR_ADMIN_TOKEN}" \
+          "${SONAR_URL}/api/users/search?p=${page}&ps=500")"
+        users="$(printf '%s' "$resp" | jq -r '.users[].login')"
+        [ -z "$users" ] && break
+
         for u in $users; do
-          auth "${SONAR_URL}/api/user_tokens/search?login=${u}" \
-          | jq -r --arg u "$u" '
-              .userTokens[]
-              | [
-                  $u,
-                  .name,
-                  .type,
-                  (.project?.key // ""),
-                  .createdAt,
-                  (.expirationDate // ""),
-                  (.lastConnectionDate // "")
-                ] | @csv' >> user_tokens.csv
+          curl -sS -H "Authorization: Bearer ${SONAR_ADMIN_TOKEN}" \
+            "${SONAR_URL}/api/user_tokens/search?login=${u}" \
+          | jq -r --arg u "$u" '.userTokens[] | [
+              $u, .name, .type, (.project?.key // ""),
+              .createdAt, (.expirationDate // ""), (.lastConnectionDate // "")
+            ] | @csv' | tee -a user_tokens.csv >/dev/null
         done
-        pi=$(jq -r '.paging.pageIndex' <<<"$resp")
-        ps=$(jq -r '.paging.pageSize'  <<<"$resp")
-        total=$(jq -r '.paging.total'  <<<"$resp")
-        (( pi * ps < total )) || break
+
+        pi="$(printf '%s' "$resp" | jq -r '.paging.pageIndex')"
+        ps="$(printf '%s' "$resp" | jq -r '.paging.pageSize')"
+        total="$(printf '%s' "$resp" | jq -r '.paging.total')"
+        if [ $(( pi * ps )) -ge "$total" ]; then break; fi
         page=$((page+1))
       done
 
-      # ---------- project_tokens.csv (filter only project analysis tokens) ----------
-      echo "project_key,token_name,owner_login,created_at,expires_at,last_used_at" > project_tokens.csv
-      tail -n +2 user_tokens.csv \
+    - tail -n +2 user_tokens.csv \
       | awk -F',' 'BEGIN{OFS=","} $3 ~ /PROJECT_ANALYSIS_TOKEN/ {print $4,$2,$1,$5,$6,$7}' \
-      >> project_tokens.csv
-
-      # Quick summary
-      echo "User tokens:    $(($(wc -l < user_tokens.csv)-1))"
-      echo "Project tokens: $(($(wc -l < project_tokens.csv)-1))"
-      BASH
+      | tee -a project_tokens.csv >/dev/null
   artifacts:
     when: always
     paths:
       - user_tokens.csv
       - project_tokens.csv
     expire_in: 7 days
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "pipeline"
-    - if: $CI_PIPELINE_SOURCE == "schedule"
-    - if: $CI_PIPELINE_SOURCE == "web"
