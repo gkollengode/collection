@@ -1,0 +1,88 @@
+image: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+
+stages:
+  - validate
+  - plan
+  - apply
+
+# Use GitLab-managed HTTP backend with the CI job identity
+variables:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_CLI_ARGS_init: "-upgrade"
+  TF_STATE_NAME: "${CI_COMMIT_REF_SLUG}"   # or set a fixed name like "prod"
+  TF_HTTP_ADDRESS: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}"
+  TF_HTTP_LOCK_ADDRESS: "${TF_HTTP_ADDRESS}/lock"
+  TF_HTTP_UNLOCK_ADDRESS: "${TF_HTTP_ADDRESS}/lock"
+  TF_HTTP_USERNAME: "gitlab-ci-token"
+  TF_HTTP_PASSWORD: "${CI_JOB_TOKEN}"
+
+# Run for MR pipelines and for the default branch
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+cache:
+  key: "${CI_PROJECT_ID}:${CI_COMMIT_REF_SLUG}"
+  paths:
+    - .terraform/
+
+validate:
+  stage: validate
+  script:
+    - terraform --version
+    - terraform init
+    - terraform fmt -check -recursive
+    - terraform validate
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+plan_mr:
+  stage: plan
+  needs: ["validate"]
+  script:
+    - terraform init
+    - terraform plan -out=tfplan
+    - terraform show -json tfplan > gl-plan.json
+  artifacts:
+    # This renders a Terraform/OpenTofu report in the MR widget
+    reports:
+      terraform: gl-plan.json
+    paths:
+      - tfplan
+      - gl-plan.json
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+plan_main:
+  stage: plan
+  needs: ["validate"]
+  script:
+    - terraform init
+    - terraform plan -out=tfplan
+    - terraform show -json tfplan > gl-plan.json
+  artifacts:
+    reports:
+      terraform: gl-plan.json
+    paths:
+      - tfplan
+      - gl-plan.json
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+apply_main:
+  stage: apply
+  needs: ["plan_main"]
+  script:
+    - terraform init
+    - terraform apply -auto-approve tfplan || { echo "Replanning on main and applying"; terraform plan -out=tfplan && terraform apply -auto-approve tfplan; }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  # Optional: guard with a protected environment if you want only Maintainers to run applies
+  # environment:
+  #   name: production
+  #   action: start
