@@ -1,1 +1,112 @@
-loc
+
+stages: [report]
+
+group-loc-report:
+  stage: report
+  image: debian:stable-slim
+  variables:
+    GIT_STRATEGY: none
+    # Required: set one of these at project or group level
+    # TARGET_GROUP_ID: "123456"                # fastest and simplest
+    # TARGET_GROUP_PATH: "my-org/my-group"     # alternative if you prefer path
+    # Optional: set if you do not want to rely on CI_JOB_TOKEN
+    # GITLAB_TOKEN: ""                         # PAT or Group Access Token with read_api and read_repository
+    INCLUDE_SUBGROUPS: "true"
+    EXCLUDE_DIRS: "node_modules,dist,build,.git,vendor,.venv,.pytest_cache,.mypy_cache,.terraform,target,.gradle,.idea,.vscode,coverage,.scannerwork"
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends git jq curl ca-certificates cloc python3
+    - rm -rf /var/lib/apt/lists/*
+    - export API_BASE="${CI_SERVER_URL%/}/api/v4"
+    - |
+      if [ -n "${GITLAB_TOKEN:-}" ]; then
+        export AUTH_HEADER="PRIVATE-TOKEN: ${GITLAB_TOKEN}"
+        export URL_USER="oauth2:${GITLAB_TOKEN}"
+      else
+        export AUTH_HEADER="JOB-TOKEN: ${CI_JOB_TOKEN}"
+        export URL_USER="gitlab-ci-token:${CI_JOB_TOKEN}"
+      fi
+    - |
+      if [ -n "${TARGET_GROUP_ID:-}" ]; then
+        export GROUP_Q="groups/${TARGET_GROUP_ID}"
+      elif [ -n "${TARGET_GROUP_PATH:-}" ]; then
+        enc_path=$(printf %s "$TARGET_GROUP_PATH" | jq -sRr @uri)
+        export GROUP_Q="groups/${enc_path}"
+      else
+        echo "Please set TARGET_GROUP_ID or TARGET_GROUP_PATH" >&2
+        exit 1
+      fi
+  script:
+    - mkdir -p out repos
+    - echo "project_path,default_branch,loc" > out/loc_report.csv
+    - total=0
+    - page=1
+    - |
+      while :; do
+        resp=$(curl -sfS --header "$AUTH_HEADER" \
+          "${API_BASE}/${GROUP_Q}/projects?include_subgroups=${INCLUDE_SUBGROUPS}&archived=false&per_page=100&simple=true&page=${page}")
+        count=$(echo "$resp" | jq 'length')
+        [ "$count" -eq 0 ] && break
+
+        echo "$resp" \
+        | jq -c '.[] | {path:.path_with_namespace, url:.http_url_to_repo, branch:(.default_branch // "main")}' \
+        | while read -r proj; do
+            path=$(echo "$proj" | jq -r .path)
+            url=$(echo "$proj" | jq -r .url)
+            branch=$(echo "$proj" | jq -r .branch)
+
+            if [ "$branch" = "null" ] || [ -z "$branch" ]; then
+              echo "Skip $path no default branch"
+              continue
+            fi
+
+            dir="repos/$(echo "$path" | tr '/' '_')"
+            auth_url="${url/https:\/\//https:\/\/$URL_USER@}"
+
+            echo "Cloning $path at $branch"
+            if ! git clone --depth 1 --no-tags --branch "$branch" "$auth_url" "$dir"; then
+              echo "Skip $path clone failed"
+              continue
+            fi
+
+            # Count lines of code
+            cloc_out="$dir/.cloc.json"
+            if ! cloc --json --quiet --exclude-dir="$EXCLUDE_DIRS" "$dir" > "$cloc_out" 2>/dev/null; then
+              echo "Skip $path cloc failed"
+              continue
+            fi
+
+            loc=$(jq -r '.SUM.code // 0' "$cloc_out" 2>/dev/null || echo 0)
+            echo "$path,$branch,$loc" >> out/loc_report.csv
+            total=$((total + loc))
+          done
+
+        page=$((page + 1))
+      done
+    - echo "TOTAL,,${total}" >> out/loc_report.csv
+    - |
+      python3 - <<'PY'
+import csv, pathlib
+p = pathlib.Path("out/loc_report.csv")
+rows = list(csv.reader(p.open()))
+hdr, data = rows[0], rows[1:]
+md = ["# Lines of Code by Project", ""]
+md.append("| Project | Default Branch | LOC |")
+md.append("|---|---|---:|")
+for proj, br, loc in data:
+    if proj == "TOTAL":
+        continue
+    md.append(f"| {proj} | {br} | {int(loc):,} |")
+tot = next((r for r in data if r[0]=="TOTAL"), None)
+if tot:
+    md.append(f"| **Total** |  | **{int(tot[2]):,}** |")
+pathlib.Path("out/LOC_Report.md").write_text("\n".join(md))
+PY
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - out/loc_report.csv
+      - out/LOC_Report.md
+  rules:
+    - when: on_success
