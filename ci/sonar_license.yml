@@ -1,1 +1,58 @@
 
+sonar-license-wiki-section:
+  stage: report
+  image: python:3.12-slim
+  variables:
+    GIT_STRATEGY: fetch
+    # Required
+    # SONAR_HOST_URL: "https://sonarqube.example.com"
+    # SONAR_TOKEN: "<admin token>"
+    # Optional
+    # SONAR_SYS_PASS: "<system passcode for /api/monitoring/metrics>"
+    WARN_DAYS: "45"
+    CRIT_DAYS: "14"
+    MERMAID: "true"
+    # Wiki target
+    WIKI_PAGE: "reports/metrics.md"   # path inside wiki repo
+    MARKER_ID: "sonar-license"        # must match markers in the page
+  before_script:
+    - python --version
+    - pip install --upgrade pip
+  script:
+    # 1) Generate the section markdown
+    - python scripts/sonar_license_section.py
+
+    # 2) Clone the wiki and replace only the marked block
+    - export WIKI_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.wiki.git"
+    - git config --global user.email "ci-bot@${CI_SERVER_HOST}"
+    - git config --global user.name "CI Bot"
+    - git clone "$WIKI_URL" wiki
+    - mkdir -p "wiki/$(dirname "$WIKI_PAGE")"
+    - touch "wiki/$WIKI_PAGE"
+    - BEGIN="<!-- BEGIN:${MARKER_ID} -->"
+    - END="<!-- END:${MARKER_ID} -->"
+    - |
+      if ! grep -qF "$BEGIN" "wiki/$WIKI_PAGE" || ! grep -qF "$END" "wiki/$WIKI_PAGE"; then
+        {
+          echo ""; echo "$BEGIN";
+          cat out/sonar_license_section.md;
+          echo "$END"; echo "";
+        } >> "wiki/$WIKI_PAGE"
+      else
+        awk -v begin="$BEGIN" -v end="$END" -v content="out/sonar_license_section.md" '
+          $0 ~ begin { print; system("cat " content); skipping=1; next }
+          $0 ~ end && skipping { print; skipping=0; next }
+          !skipping { print }
+        ' "wiki/$WIKI_PAGE" > "wiki/$WIKI_PAGE.tmp" && mv "wiki/$WIKI_PAGE.tmp" "wiki/$WIKI_PAGE"
+      fi
+    - git -C wiki add "$WIKI_PAGE"
+    - git -C wiki commit -m "Update Sonar license section for ${CI_COMMIT_SHORT_SHA}" || echo "No changes"
+    - git -C wiki push
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - out/sonar_license_section.md
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
