@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""
+Get the most recent analysis date for a SonarQube project.
+
+Usage:
+  python sonar_last_analysis.py --server https://sonar.example.com --project GROUP_KEY:PROJECT_KEY [--branch main]
+  # Auth comes from environment variable SONAR_TOKEN, or pass --token
+
+Output:
+  ISO 8601 timestamp in UTC, plus raw API timestamp
+"""
+import argparse, os, sys, re, datetime as dt
+import requests
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Fetch last SonarQube analysis date")
+    p.add_argument("--server", required=True, help="SonarQube base URL, e.g. https://sonar.example.com")
+    p.add_argument("--project", required=True, help="Project key")
+    p.add_argument("--branch", help="Branch name to filter (optional)")
+    p.add_argument("--token", help="SonarQube token (else read SONAR_TOKEN env)")
+    return p.parse_args()
+
+def parse_sonar_datetime(s: str) -> dt.datetime:
+    """Handle SonarQube formats like '2023-06-01T12:34:56+0000' or with 'Z' or milliseconds."""
+    s2 = re.sub(r"\.\d+", "", s)  # drop fractional seconds if present
+    fmts = ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ"]
+    for fmt in fmts:
+        try:
+            if fmt.endswith("Z") and s2.endswith("Z"):
+                return dt.datetime.strptime(s2, fmt).replace(tzinfo=dt.timezone.utc)
+            return dt.datetime.strptime(s2 if s2[-3] != ":" else s2[:-3] + s2[-2:], "%Y-%m-%dT%H:%M:%S%z")
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized date format: {s!r}")
+
+def fetch_last_analysis(server: str, project: str, token: str, branch: str | None) -> tuple[str, dt.datetime]:
+    url = server.rstrip("/") + "/api/project_analyses/search"
+    params = {"project": project, "ps": 100}
+    if branch:
+        params["branch"] = branch
+
+    newest_raw = None
+    newest_dt = None
+    page = 1
+
+    while True:
+        params["p"] = page
+        r = requests.get(url, params=params, auth=(token, ""), timeout=20)
+        if r.status_code == 401:
+            raise SystemExit("Unauthorized. Check token permissions.")
+        r.raise_for_status()
+        data = r.json()
+        analyses = data.get("analyses", [])
+        if not analyses:
+            break
+        for a in analyses:
+            raw = a.get("date") or a.get("createdAt")
+            if not raw:
+                continue
+            try:
+                adt = parse_sonar_datetime(raw)
+            except ValueError:
+                continue
+            if newest_dt is None or adt > newest_dt:
+                newest_dt, newest_raw = adt, raw
+        paging = data.get("paging", {})
+        total = int(paging.get("total", len(analyses)))
+        page_size = int(paging.get("pageSize", 100))
+        if page * page_size >= total:
+            break
+        page += 1
+
+    if newest_dt is None:
+        scope = f"project={project}" + (f", branch={branch}" if branch else "")
+        raise SystemExit(f"No analyses found for {scope}")
+
+    return newest_raw, newest_dt.astimezone(dt.timezone.utc)
+
+def main():
+    args = parse_args()
+    token = args.token or os.getenv("SONAR_TOKEN")
+    if not token:
+        raise SystemExit("Missing token. Set --token or SONAR_TOKEN.")
+
+    raw, utc_dt = fetch_last_analysis(args.server, args.project, token, args.branch)
+    print(utc_dt.isoformat().replace("+00:00", "Z"))  # normalized UTC
+    print(f"(raw: {raw})")
+
+if __name__ == "__main__":
+    main()
