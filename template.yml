@@ -1,0 +1,127 @@
+stages:
+  - extract
+  - sonar
+
+# ------------ Extract compiled outputs from the built image ------------
+# Set SOURCE_IMAGE if the builder uses a different tag or another registry
+extract:binaries:
+  stage: extract
+  image: docker:27
+  services:
+    - name: docker:27-dind
+      command: ["--tls=false"]
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_BUILDKIT: "1"
+    # Default: image built in this project, tagged by commit SHA
+    SOURCE_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    # Optional override creds if pulling from another project/registry
+    REGISTRY_USER: $CI_REGISTRY_USER
+    REGISTRY_PASSWORD: $CI_REGISTRY_PASSWORD
+    REGISTRY_HOST: $CI_REGISTRY
+  before_script:
+    - docker login -u "$REGISTRY_USER" -p "$REGISTRY_PASSWORD" "$REGISTRY_HOST" || true
+  script: |
+    set -euo pipefail
+    echo "Pulling $SOURCE_IMAGE"
+    docker pull "$SOURCE_IMAGE"
+
+    # Create a temp container and copy likely build outputs out
+    cid=$(docker create "$SOURCE_IMAGE")
+    mkdir -p sonar_payload
+
+    # Known Gradle/Maven locations; copy what exists
+    for p in \
+      /src/build \
+      /workspace/build \
+      /project/build \
+      /app/build \
+      /src/target \
+      /workspace/target \
+      /project/target \
+      /app/target
+    do
+      docker cp "$cid":"$p" sonar_payload/ 2>/dev/null && echo "Copied $p" || true
+    done
+
+    # Fallback: discover .class trees and copy their parent dirs (limited)
+    docker start "$cid" >/dev/null
+    docker exec "$cid" sh -lc '
+      set -e
+      for d in /src /workspace /project /app /home/gradle; do
+        [ -d "$d" ] && find "$d" -type f -name "*.class" -printf "%h\n" || true
+      done | sort -u | head -n 50
+    ' > dirs.txt || true
+
+    while read -r d; do
+      [ -n "$d" ] || continue
+      safe="classes$(echo "$d" | tr "/ " "__")"
+      docker cp "$cid":"$d" "sonar_payload/$safe" 2>/dev/null || true
+    done < dirs.txt
+
+    docker rm -v "$cid"
+
+    # Derive paths for Sonar
+    BIN_DIRS=$(find sonar_payload -type d -path "*/classes*" | paste -sd, - || true)
+    [ -z "$BIN_DIRS" ] && BIN_DIRS=$(find sonar_payload -type d -path "*/build/classes/*/main" | paste -sd, - || true)
+    JUNIT_DIR=$(find sonar_payload -type d -path "*/test-results/test" | head -n1 || true)
+    JACOCO_XML=$(find sonar_payload -type f \( -name "jacocoTestReport.xml" -o -name "jacoco.xml" \) | head -n1 || true)
+
+    {
+      echo "SONAR_BINARIES=${BIN_DIRS}"
+      echo "SONAR_JUNIT=${JUNIT_DIR}"
+      echo "SONAR_JACOCO=${JACOCO_XML}"
+    } > sonar_payload/paths.env
+
+    echo "Discovered binaries: ${BIN_DIRS:-none}"
+    echo "JUnit reports: ${JUNIT_DIR:-none}"
+    echo "Jacoco XML: ${JACOCO_XML:-none}"
+  artifacts:
+    name: "sonar-payload-$CI_COMMIT_REF_SLUG"
+    expire_in: 7 days
+    when: always
+    paths:
+      - sonar_payload/
+  rules:
+    - if: $ENABLE_SONAR == "false"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_TAG == null
+
+# ------------ Run Sonar later using repo sources + extracted binaries ------------
+sonar:scan:
+  stage: sonar
+  image: sonarsource/sonar-scanner-cli:latest
+  needs: ["extract:binaries"]
+  variables:
+    # Set these at group or project level
+    SONAR_HOST_URL: https://your-sonarqube-or-sonarcloud
+    SONAR_PROJECT_KEY: your_project_key
+    SONAR_ORGANIZATION: ""   # only for SonarCloud
+  script: |
+    set -euo pipefail
+    [ -f sonar_payload/paths.env ] && source sonar_payload/paths.env || true
+
+    # Fall back if nothing was discovered
+    SONAR_BINARIES="${SONAR_BINARIES:-build/classes/java/main,build/classes/kotlin/main}"
+
+    # Build arg list
+    args=(
+      -Dsonar.host.url="$SONAR_HOST_URL"
+      -Dsonar.projectKey="$SONAR_PROJECT_KEY"
+      -Dsonar.token="$SONAR_TOKEN"
+      -Dsonar.sources=src
+      -Dsonar.tests=src
+      -Dsonar.exclusions=**/build/**,**/target/**,**/.gradle/**
+      -Dsonar.java.binaries="$SONAR_BINARIES"
+    )
+    [ -n "${SONAR_ORGANIZATION:-}" ] && args+=(-Dsonar.organization="$SONAR_ORGANIZATION")
+    [ -n "${SONAR_JUNIT:-}" ] && args+=(-Dsonar.junit.reportPaths="$SONAR_JUNIT")
+    [ -n "${SONAR_JACOCO:-}" ] && args+=(-Dsonar.coverage.jacoco.xmlReportPaths="$SONAR_JACOCO")
+
+    sonar-scanner "${args[@]}"
+  rules:
+    - if: $ENABLE_SONAR == "false"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_TAG == null
