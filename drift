@@ -1,0 +1,18 @@
+tofu:drift:
+  stage: drift
+  extends: [.default, .rules-when-terraform]
+  script:
+    - tofu -chdir="$TERRAFORM_DIR" init \
+        -backend-config="bucket=$TF_STATE_BUCKET" \
+        -backend-config="key=$TF_STATE_KEY" \
+        -backend-config="region=$AWS_DEFAULT_REGION"
+    - tofu -chdir="$TERRAFORM_DIR" workspace select "$TF_WORKSPACE" || tofu -chdir="$TERRAFORM_DIR" workspace new "$TF_WORKSPACE"
+    - tofu -chdir="$TERRAFORM_DIR" plan -detailed-exitcode -lock=false || export DRIFT_EXIT=$?
+    - |
+      case "${DRIFT_EXIT:-0}" in
+        0) echo "No drift";;
+        2) echo "Drift detected"; exit 2;;
+        *) echo "Plan error"; exit 1;;
+      esac
+  needs: ["tofu:plan"]
+  allow_failure: true   # surface signal without failing full pipeline
