@@ -1,0 +1,61 @@
+stages: [precheck]
+
+.precheck-defaults:
+  image: alpine:3.22
+  before_script:
+    - set -euo pipefail
+    - apk add --no-cache bash jq coreutils curl >/dev/null
+
+# Comma-separated list of required env vars
+# You can override this in the consuming project
+variables:
+  REQUIRED_VARS: "TF_STATE_BUCKET,TF_STATE_KEY,AWS_DEFAULT_REGION"
+  TERRAFORM_DIR: "${TERRAFORM_DIR:-.}"
+
+precheck:variables:
+  stage: precheck
+  extends: .precheck-defaults
+  rules:
+    - when: always
+  script:
+    - |
+      err=0
+      IFS=',' read -ra VARS <<< "${REQUIRED_VARS}"
+      need() {
+        local name="$1"
+        local val="${!name-}"
+        if [ -z "${val}" ]; then
+          echo "Missing required variable: $name" >&2
+          err=1
+        fi
+      }
+      for v in "${VARS[@]}"; do need "$(echo "$v" | xargs)"; done
+
+      # Optional workspace default
+      TF_WORKSPACE="${TF_WORKSPACE:-default}"
+      echo "Workspace: $TF_WORKSPACE"
+
+      # Verify Terraform directory exists and has .tf files
+      if [ ! -d "$TERRAFORM_DIR" ]; then
+        echo "Terraform directory not found: $TERRAFORM_DIR" >&2
+        err=1
+      elif ! find "$TERRAFORM_DIR" -maxdepth 1 -type f -name "*.tf" | read -r _; then
+        echo "No .tf files found in $TERRAFORM_DIR" >&2
+        err=1
+      fi
+
+      # Check AWS auth quickly
+      if ! apk add --no-cache aws-cli >/dev/null 2>&1; then
+        echo "aws-cli install failed" >&2
+        err=1
+      elif ! aws sts get-caller-identity --output text >/dev/null 2>&1; then
+        echo "AWS credentials not usable for this job" >&2
+        err=1
+      fi
+
+      if [ "$err" -ne 0 ]; then
+        echo "Precheck failed" >&2
+        exit 1
+      fi
+
+      echo "Precheck passed"
