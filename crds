@@ -1,0 +1,18 @@
+for crd in $(kubectl get crd | awk '/karpenter/ {print $1}'); do
+echo "Fixing ownership on $crd"
+kubectl label crd "$crd" \
+app.kubernetes.io/managed-by=Helm --overwrite
+
+
+kubectl annotate crd "$crd" \
+meta.helm.sh/release-name=karpenter \
+meta.helm.sh/release-namespace=${KARPENTER_NAMESPACE:-karpenter} \
+--overwrite
+
+
+done
+
+
+# Verify on one CRD
+kubectl get crd awsnodetemplates.karpenter.k8s.aws -o yaml | \
+egrep 'meta.helm.sh|managed-by' -C2
